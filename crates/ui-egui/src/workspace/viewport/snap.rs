@@ -61,7 +61,9 @@ impl Workspace {
 
     fn find_body_points_on(&self, plane: &SketchPlane) -> Vec<PlanePoint> {
         let n = plane.normal();
-        let on = |p: DVec3| (p - plane.origin).dot(n).abs() < 1e-4 * (1.0 + p.length());
+        // On the plane to within what single-precision mesh points carry. Not further: as observed, a board's
+        // silkscreen and pads 0.002 mm above its face show no points while the parts standing on the face do.
+        let on = |p: DVec3| (p - plane.origin).dot(n).abs() < 5e-4 + 1e-6 * p.length();
         let mut out: Vec<PlanePoint> = Vec::new();
         // Points closer than 1e-6 are one: found through a grid of that size (the cell and its neighbours).
         let mut seen: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();

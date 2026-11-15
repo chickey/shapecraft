@@ -86,6 +86,8 @@ struct BodyUniform {
     material: [f32; 4],
     flags: [u32; 4],
     sel: [u32; MAX_SELECTED_FACES],
+    /// x: how far the colour is washed towards the grey in y (linear).
+    wash: [f32; 4],
 }
 
 #[repr(C)]
@@ -999,6 +1001,7 @@ impl Renderer {
             b.used = false;
         }
         let sketching = scene.active_sketch.is_some() && !scene.presentation && scene.display.solid();
+        let on_face = scene.active_sketch.and_then(|id| scene.doc.sketch(id)).is_some_and(|s| s.on_body.is_some());
         let view_proj = camera.view_proj(px);
         let mut draws = Vec::new();
         let mut ghost_draws = Vec::new();
@@ -1014,6 +1017,7 @@ impl Renderer {
             }
             let mut color = c.body.linear();
             let mut material = [0.0, 0.0, 0.0, if scene.presentation { 1.0 } else { 0.0 }];
+            let mut wash = [0.0; 4];
             if let Some(a) = &body.appearance {
                 let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
                 color = [lin(a.color[0]), lin(a.color[1]), lin(a.color[2]), 1.0];
@@ -1033,6 +1037,10 @@ impl Renderer {
                 color[3] = color[3].min(0.85);
             } else if scene.display == DisplayMode::XRay {
                 color[3] = c.xray.clamp(0.02, 0.95);
+            } else if sketching && on_face {
+                // As observed sketching on a board's face: bodies stay solid and every colour, a face's own too,
+                // washes about half way to a light grey (black comes out ~122, a gold pad 190/156/124).
+                wash = [0.48, 0.41, 0.0, 0.0];
             } else if sketching {
                 // As observed, bodies fade while sketching so the sketch plane's grid shows through them.
                 color[3] = 0.4;
@@ -1044,6 +1052,7 @@ impl Renderer {
                 material,
                 flags: [0; 4],
                 sel: [0; MAX_SELECTED_FACES],
+                wash,
             };
             let mut n = 0usize;
             for p in scene.selection {

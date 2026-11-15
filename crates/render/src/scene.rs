@@ -266,11 +266,20 @@ pub(crate) fn build(scene: &SceneInput, camera: &Camera, size: DVec2) -> Built {
 
     if let Some(plane) = scene.grid.filter(|_| !scene.presentation) {
         let first = out.segments.len();
-        grid(&mut out, plane, camera, wpp, c);
-        // While sketching, the plane's grid shows through the faded bodies, as observed.
-        if scene.active_sketch.is_some() {
-            for s in &mut out.segments[first..] {
-                s.overlay = true;
+        let on_face = scene.active_sketch.and_then(|id| scene.doc.sketch(id)).is_some_and(|s| s.on_body.is_some());
+        if on_face {
+            // Sketching on a face, the bodies stay solid and hide the grid, as observed: it goes behind the face by
+            // more than lines are drawn towards the eye (0.2% of the way), so the face wins where they meet.
+            let back = plane.normal() * (camera.eye() - plane.origin).length() * 0.004;
+            let back = if (camera.eye() - plane.origin).dot(plane.normal()) > 0.0 { -back } else { back };
+            grid(&mut out, SketchPlane { origin: plane.origin + back, ..plane }, camera, wpp, c);
+        } else {
+            grid(&mut out, plane, camera, wpp, c);
+            // While sketching, the plane's grid shows through the faded bodies, as observed.
+            if scene.active_sketch.is_some() {
+                for s in &mut out.segments[first..] {
+                    s.overlay = true;
+                }
             }
         }
     }

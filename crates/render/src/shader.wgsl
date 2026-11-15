@@ -80,6 +80,8 @@ struct Body {
     // x: whole body selected, y: hovered face + 1 (0 = none), z: number of selected faces, w: body hovered
     flags: vec4<u32>,
     sel: array<vec4<u32>, 4>,
+    // x: how far the colour is washed towards the grey in y (linear), while sketching on a face
+    wash: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> b: Body;
 
@@ -162,6 +164,7 @@ fn fs_mesh(v: MeshOut) -> @location(0) vec4<f32> {
     let top = pow(1.0 / length(g.light.xyz) * g.light.z, 1.5);
     let shade = (0.08 + 0.92 * key) / (0.08 + 0.92 * top);
     var base = select(b.color.rgb, v.paint.rgb, v.paint.a > 0.5);
+    base = mix(base, vec3<f32>(b.wash.y), b.wash.x);
     // Surface analysis replaces the colour (selection still shows).
     if (g.analysis.x > 0.5 && !face_selected(v.face) && b.flags.x == 0u) {
         if (g.analysis.x < 1.5) {
