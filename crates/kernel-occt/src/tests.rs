@@ -1359,3 +1359,42 @@ fn offset_stops_at_its_time_limit() {
     assert!(late.as_deref().is_some_and(|e| e.contains("time limit")), "{late:?}");
     assert!(fine);
 }
+
+/// A closed chain offsets outwards for a positive distance and inwards for a negative one, however its edges run.
+#[test]
+fn offset_of_a_closed_chain_goes_the_side_the_sign_says() {
+    use shapecraft_kernel::{PlanarCurve, PlaneFrame};
+    let k = k();
+    let frame = PlaneFrame { origin: DVec3::ZERO, x: DVec3::X, y: DVec3::Y };
+    let p = |x: f64, y: f64| DVec3::new(x, y, 0.0);
+    let stadium = |reverse: bool| {
+        let mut c = vec![
+            PlanarCurve::Line { a: p(10.0, -10.0), b: p(30.0, -10.0) },
+            PlanarCurve::Arc { a: p(30.0, -10.0), mid: p(40.0, 0.0), b: p(30.0, 10.0) },
+            PlanarCurve::Line { a: p(30.0, 10.0), b: p(10.0, 10.0) },
+            PlanarCurve::Arc { a: p(10.0, 10.0), mid: p(0.0, 0.0), b: p(10.0, -10.0) },
+        ];
+        if reverse {
+            c = c
+                .into_iter()
+                .rev()
+                .map(|c| match c {
+                    PlanarCurve::Line { a, b } => PlanarCurve::Line { a: b, b: a },
+                    PlanarCurve::Arc { a, mid, b } => PlanarCurve::Arc { a: b, mid, b: a },
+                    other => other,
+                })
+                .collect();
+        }
+        c
+    };
+    let width = |curves: &[PlanarCurve], d: f64| {
+        let shape = k.offset_curves(frame, curves, d).unwrap();
+        let b = k.bounds(&shape).unwrap();
+        b.max.x - b.min.x
+    };
+    for reverse in [false, true] {
+        let c = stadium(reverse);
+        assert!((width(&c, 2.0) - 44.0).abs() < 0.1, "positive goes outwards (reversed {reverse}): {}", width(&c, 2.0));
+        assert!((width(&c, -2.0) - 36.0).abs() < 0.1, "negative goes inwards (reversed {reverse}): {}", width(&c, -2.0));
+    }
+}

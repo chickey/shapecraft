@@ -649,3 +649,51 @@ fn offset_edge_takes_body_edges_on_the_sketch_plane() {
     let off = json!([{"body": body.0, "edge": s.doc.bodies[0].mesh.edge_ids[side]}]);
     assert!(s.execute("offset_edge", &json!({"edges": off, "distance": 1})).is_err());
 }
+
+/// Offset Edge on a body's outline goes outwards for a positive distance and inwards for a negative one, whichever
+/// way the outline's edges happen to run: a stadium (two lines and two half circles) drawn both ways round.
+#[test]
+fn offsetting_body_edges_goes_the_side_the_sign_says() {
+    for clockwise in [false, true] {
+        let mut s = session();
+        s.execute("sketch", &json!({"plane": "xy"})).unwrap();
+        // 40 × 20 with half circles of radius 10 at both ends.
+        let pts: Vec<[f64; 2]> = vec![[10.0, -10.0], [30.0, -10.0], [30.0, 10.0], [10.0, 10.0]];
+        let order: Vec<usize> = if clockwise { vec![3, 2, 1, 0] } else { vec![0, 1, 2, 3] };
+        let p = |i: usize| pts[order[i % 4]];
+        s.execute("line", &json!({"a": p(0), "b": p(1)})).unwrap();
+        s.execute("arc", &json!({"a": p(1), "mid": [40.0, 0.0], "b": p(2)})).unwrap();
+        s.execute("line", &json!({"a": p(2), "b": p(3)})).unwrap();
+        s.execute("arc", &json!({"a": p(3), "mid": [0.0, 0.0], "b": p(0)})).unwrap();
+        s.execute("extrude", &json!({"sketch": s.active_sketch.unwrap().0, "region": 0, "distance": 5})).unwrap();
+        let body = s.doc.bodies[0].id;
+        let top = (0..s.kernel.face_count(&s.doc.bodies[0].shape).unwrap())
+            .find(|&f| s.kernel.face_plane(&s.doc.bodies[0].shape, f).unwrap().is_some_and(|p| p.origin.z > 4.9))
+            .unwrap();
+        s.execute("sketch", &json!({"body": body.0, "face": top})).unwrap();
+        let sketch = s.active_sketch.unwrap();
+        let m = s.doc.bodies[0].mesh.clone();
+        let edges: Vec<serde_json::Value> = (0..m.edges.len())
+            .filter(|&k| m.edges[k].iter().all(|p| (p[2] - 5.0).abs() < 1e-4))
+            .map(|k| json!({"body": body.0, "edge": m.edge_ids[k]}))
+            .collect();
+        assert_eq!(edges.len(), 4, "clockwise {clockwise}");
+        let width = |s: &crate::Session| {
+            let sk = s.doc.sketch(sketch).unwrap();
+            let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+            for e in &sk.entities {
+                for q in e.outline() {
+                    lo = lo.min(q.x);
+                    hi = hi.max(q.x);
+                }
+            }
+            hi - lo
+        };
+        let mut out = s.fork();
+        out.execute("offset_edge", &json!({"edges": edges, "distance": 2})).unwrap();
+        assert!((width(&out) - 44.0).abs() < 0.2, "positive goes outwards (clockwise {clockwise}): {}", width(&out));
+        let mut inw = s.fork();
+        inw.execute("offset_edge", &json!({"edges": edges, "distance": -2})).unwrap();
+        assert!((width(&inw) - 36.0).abs() < 0.2, "negative goes inwards (clockwise {clockwise}): {}", width(&inw));
+    }
+}

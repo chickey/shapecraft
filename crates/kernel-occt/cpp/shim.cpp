@@ -2923,10 +2923,43 @@ int sk_offset_curves(const double* plane, const int* kinds, const double* data, 
     gp_Pln pln(gp_Ax3(gp_Pnt(plane[0], plane[1], plane[2]), nd, xd));
     BRepBuilderAPI_MakeFace base(pln);
     if (!base.IsDone()) return fail("bad sketch plane");
-    BRepOffsetAPI_MakeOffset mk;
-    mk.Init(base.Face(), GeomAbs_Intersection, !BRep_Tool::IsClosed(w));
-    mk.AddWire(w);
-    return offset_result(mk, distance, out);
+    const bool closed = BRep_Tool::IsClosed(w);
+    auto offset = [&](const TopoDS_Wire& wire, double d, TopoDS_Shape& r) {
+      BRepOffsetAPI_MakeOffset mk;
+      mk.Init(base.Face(), GeomAbs_Intersection, !closed);
+      mk.AddWire(wire);
+      mk.Perform(d);
+      if (!mk.IsDone() || mk.Shape().IsNull()) return false;
+      r = mk.Shape();
+      return true;
+    };
+    TopoDS_Shape r;
+    bool done = offset(w, distance, r);
+    // A closed chain offsets to the side the direction of its edges says, which differs from one chain to the next
+    // and isn't always the sign's: positive is outwards, so a result that went the wrong way is redone with the
+    // chain turned round, then with the sign changed, and the first that goes the right way is kept. (Open chains
+    // offset to the left of their direction, as before.)
+    if (closed && done && std::abs(distance) > 0.0) {
+      Bnd_Box before;
+      BRepBndLib::Add(w, before);
+      auto outwards = [&](const TopoDS_Shape& result) {
+        Bnd_Box after;
+        BRepBndLib::Add(result, after);
+        return !after.IsVoid() && after.SquareExtent() > before.SquareExtent();
+      };
+      if (!before.IsVoid() && outwards(r) != (distance > 0.0)) {
+        const TopoDS_Wire turned = TopoDS::Wire(w.Reversed());
+        TopoDS_Shape other;
+        for (auto [wire, d] : {std::pair<TopoDS_Wire, double>{turned, distance}, {w, -distance}, {turned, -distance}}) {
+          if (offset(wire, d, other) && outwards(other) == (distance > 0.0)) {
+            r = other;
+            break;
+          }
+        }
+      }
+    }
+    if (!done) return fail("offset failed (too far for this shape?)");
+    return put(out, r);
   });
 }
 
