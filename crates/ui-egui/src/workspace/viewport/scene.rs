@@ -265,7 +265,7 @@ impl Workspace {
             }
         }
         if let Some(pl) = plane {
-            for (p, _, corner) in self.body_points_on(&pl) {
+            for &(p, _, corner) in self.body_points_on(&pl).iter() {
                 out.push(Overlay::Dot { p: pl.to_world(p), color: Rgba::hex(0x8b5cf6), size: if corner { 6.0 } else { 4.0 } });
             }
         }

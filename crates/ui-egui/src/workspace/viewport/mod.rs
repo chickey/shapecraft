@@ -40,6 +40,8 @@ use crate::theme::{self, Tokens, radius};
 pub(in crate::workspace) use clicks::PenStroke;
 pub(in crate::workspace) use dimensions::{DimEdit, DimKind, format_degrees};
 pub use gpu::ViewportGpu;
+/// A key point of what lies on a sketch plane: where (in the plane), its snap name, and whether it's a corner.
+pub(crate) type PlanePoint = (glam::DVec2, &'static str, bool);
 pub(crate) use gpu::unmix;
 pub(in crate::workspace) use paint::PILL_INK;
 

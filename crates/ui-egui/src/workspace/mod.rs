@@ -262,6 +262,8 @@ pub struct Workspace {
     pub camera: Camera,
     /// The selection's box as last worked out, with what it was worked out for ([`Workspace::selection_bounds`]).
     pub(crate) selection_box: std::cell::Cell<camera::KeptBox>,
+    /// The key points of what lies on a sketch plane, with what they were found for ([`Workspace::body_points_on`]).
+    pub(crate) plane_points: std::cell::RefCell<Option<(u64, std::sync::Arc<Vec<viewport::PlanePoint>>)>>,
     pub(crate) anim: Option<Anim>,
     pub tool: Tool,
     /// A sketch tool chosen before a plane was picked; started once there is one.
@@ -702,6 +704,7 @@ impl Workspace {
             camera,
             anim: None,
             selection_box: Default::default(),
+            plane_points: Default::default(),
             tool: Tool::Idle,
             pending_tool: None,
             items_focus: false,

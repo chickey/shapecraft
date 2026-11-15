@@ -476,7 +476,7 @@ impl Workspace {
             // The picked face's snap points, purple (386): its corners and edge middles and its middle.
             let plane = SketchPlane::from_normal(fp.origin, fp.normal);
             if let Some(plane) = plane {
-                for (q, ..) in self.body_points_on(&plane) {
+                for &(q, ..) in self.body_points_on(&plane).iter() {
                     if let Some(s) = self.to_screen(plane.to_world(q)) {
                         painter.circle_filled(s, 3.5, theme::c(0x8b5cf6));
                         painter.circle_stroke(s, 3.5, Stroke::new(1.0, Color32::WHITE));

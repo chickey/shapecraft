@@ -8,6 +8,7 @@ use shapecraft_doc::{Pick, SketchEntity, SketchPlane};
 use crate::theme;
 use crate::workspace::Workspace;
 use crate::workspace::tools::Tool;
+use crate::workspace::viewport::PlanePoint;
 
 const SNAP_PX: f64 = 10.0;
 const ALIGN_PX: f64 = 7.0;
@@ -34,18 +35,53 @@ impl Workspace {
 
     /// Corners, edge middles and face centers of the bodies that lie on a sketch plane (they snap and show purple
     /// while sketching, as observed), in the plane's coordinates; `true` marks corners.
-    pub(in crate::workspace) fn body_points_on(&self, plane: &SketchPlane) -> Vec<(DVec2, &'static str, bool)> {
+    ///
+    /// Asked every frame while sketching, so the answer is kept for as long as the plane and the visible bodies'
+    /// meshes stay the same: on a board with hundreds of parts sitting on it, working it out takes far longer than a
+    /// frame.
+    pub(in crate::workspace) fn body_points_on(&self, plane: &SketchPlane) -> std::sync::Arc<Vec<PlanePoint>> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in [plane.origin, plane.x, plane.y] {
+            v.to_array().map(f64::to_bits).hash(&mut h);
+        }
+        for body in self.session.doc.bodies.iter().filter(|b| b.visible) {
+            (body.id.0, std::sync::Arc::as_ptr(&body.mesh) as usize).hash(&mut h);
+        }
+        let key = h.finish();
+        if let Some((was, points)) = self.plane_points.borrow().as_ref()
+            && *was == key
+        {
+            return points.clone();
+        }
+        let points = std::sync::Arc::new(self.find_body_points_on(plane));
+        *self.plane_points.borrow_mut() = Some((key, points.clone()));
+        points
+    }
+
+    fn find_body_points_on(&self, plane: &SketchPlane) -> Vec<PlanePoint> {
         let n = plane.normal();
         let on = |p: DVec3| (p - plane.origin).dot(n).abs() < 1e-4 * (1.0 + p.length());
-        let mut out: Vec<(DVec2, &'static str, bool)> = Vec::new();
+        let mut out: Vec<PlanePoint> = Vec::new();
+        // Points closer than 1e-6 are one: found through a grid of that size (the cell and its neighbours).
+        let mut seen: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
         let mut push = |p: DVec3, name: &'static str, corner: bool| {
             let q = plane.to_local(p);
-            if !out.iter().any(|(o, ..)| o.distance(q) < 1e-6) {
+            let cell = ((q.x * 1e6).floor() as i64, (q.y * 1e6).floor() as i64);
+            let near = (-1..=1).flat_map(|dx| (-1..=1).map(move |dy| (cell.0 + dx, cell.1 + dy)));
+            let taken = near.into_iter().any(|c| seen.get(&c).is_some_and(|ix| ix.iter().any(|&i| out[i].0.distance(q) < 1e-6)));
+            if !taken {
+                seen.entry(cell).or_default().push(out.len());
                 out.push((q, name, corner));
             }
         };
         for body in self.session.doc.bodies.iter().filter(|b| b.visible) {
             let m = &body.mesh;
+            // Most bodies have nothing on the plane: a look at their vertices settles it before their edges and
+            // triangles are walked.
+            if !m.positions.iter().any(|p| on(DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64))) {
+                continue;
+            }
             for line in &m.edges {
                 let pts: Vec<DVec3> = line.iter().map(|p| DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64)).collect();
                 let (Some(&a), Some(&b)) = (pts.first(), pts.last()) else { continue };
@@ -118,7 +154,7 @@ impl Workspace {
                 }
             }
         }
-        for (p, n, _) in self.body_points_on(&plane) {
+        for &(p, n, _) in self.body_points_on(&plane).iter() {
             keys.push(p);
             names.push(n);
         }
@@ -398,4 +434,32 @@ pub(super) fn seg_dist(p: DVec2, a: DVec2, b: DVec2) -> (f64, f64) {
 /// The other half-axis of an ellipse with center `c` and first axis end `m`: the cursor's distance from that axis.
 pub(super) fn ellipse_minor(c: DVec2, m: DVec2, cursor: DVec2) -> f64 {
     (cursor - c).dot((m - c).normalize_or_zero().perp()).abs()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod plane_point_tests {
+    use super::*;
+    use serde_json::json;
+    use shapecraft_engine::Session;
+    use std::sync::Arc;
+
+    /// A block's top face lies on a sketch plane at its height: its four corners, four edge middles and middle are
+    /// found once, kept while nothing changes, and found again when a body moves.
+    #[test]
+    fn points_on_a_plane_are_found_once_and_kept() {
+        let mut s = Session::new(Arc::new(shapecraft_kernel_occt::OcctKernel::new()), "Plane points");
+        s.execute("sketch", &json!({"plane": "xy"})).unwrap();
+        s.execute("rectangle", &json!({"corner": [0, 0], "opposite": [10, 20]})).unwrap();
+        s.execute("extrude", &json!({"sketch": s.active_sketch.unwrap().0, "region": 0, "distance": 5})).unwrap();
+        let ws = Workspace::new(s, crate::settings::Settings::default());
+        let top = SketchPlane { origin: DVec3::new(0.0, 0.0, 5.0), x: DVec3::X, y: DVec3::Y };
+        let first = ws.body_points_on(&top);
+        assert_eq!(first.iter().filter(|p| p.2).count(), 4, "{first:?}");
+        assert_eq!(first.iter().filter(|p| p.1 == "Midpoint").count(), 4);
+        assert_eq!(first.iter().filter(|p| p.1 == "Center").count(), 1);
+        assert!(Arc::ptr_eq(&first, &ws.body_points_on(&top)), "kept while nothing changes");
+        let other = SketchPlane { origin: DVec3::new(0.0, 0.0, 7.0), x: DVec3::X, y: DVec3::Y };
+        assert!(ws.body_points_on(&other).is_empty(), "nothing lies on a plane above the block");
+    }
 }
