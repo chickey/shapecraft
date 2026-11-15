@@ -15,6 +15,7 @@
 #include <BRepTools_WireExplorer.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <Geom_Surface.hxx>
 #include <GProp_GProps.hxx>
 #include <Geom2d_BSplineCurve.hxx>
 #include <GeomAPI_Interpolate.hxx>
@@ -47,6 +48,7 @@
 #include <gp_Circ.hxx>
 #include <gp_Elips.hxx>
 #include <algorithm>
+#include <ShapeBuild_ReShape.hxx>
 #include <ShapeFix_Shape.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
@@ -726,7 +728,9 @@ struct Curve {
   long surface = -1;
 };
 
-TopoDS_Shape build(Rd& r) {
+// `made`, when given, receives what became of each face of the stream (in its order) once the shape is repaired: the
+// face itself, its replacement, or a null shape when the repair removed it.
+TopoDS_Shape build(Rd& r, std::vector<TopoDS_Shape>* made = nullptr) {
   size_t kind = r.idx(3);
   size_t ns = r.idx(CAP);
   // Surfaces may refer to curves (revolution, extrusion) that come later in the stream: keep their
@@ -1067,6 +1071,11 @@ TopoDS_Shape build(Rd& r) {
     BRepGProp::VolumeProperties(result, g);
     if (g.Mass() < 0) result.Reverse();
   }
+  if (made) {
+    Handle(ShapeBuild_ReShape) context = fix.Context();
+    made->clear();
+    for (const TopoDS_Face& f : faces) made->push_back(context.IsNull() ? TopoDS_Shape(f) : context->Value(f));
+  }
   return result;
 }
 
@@ -1399,6 +1408,54 @@ int sk_from_brep(const double* data, size_t n, SkShape** out) {
     Rd r{data, n};
     TopoDS_Shape s = build(r);
     if (s.IsNull()) return sk_fail_external("empty body");
+    *out = new SkShape{s};
+    return 0;
+  });
+}
+
+// As sk_from_brep, and where each of the stream's `nfaces` faces ended up: its index among the shape's faces (as
+// tessellation numbers them), or UINT32_MAX when the repair split, merged or removed it.
+int sk_from_brep_faces(const double* data, size_t n, SkShape** out, uint32_t* face_index, size_t nfaces) {
+  return guard_b([&] {
+    for (size_t i = 0; i < nfaces; ++i) face_index[i] = UINT32_MAX;
+    Rd r{data, n};
+    std::vector<TopoDS_Shape> made;
+    TopoDS_Shape s = build(r, &made);
+    if (s.IsNull()) return sk_fail_external("empty body");
+    TopTools_IndexedMapOfShape map;
+    TopExp::MapShapes(s, TopAbs_FACE, map);
+    std::vector<bool> claimed(size_t(map.Extent()), false);
+    for (size_t i = 0; i < nfaces && i < made.size(); ++i) {
+      if (made[i].IsNull() || made[i].ShapeType() != TopAbs_FACE) continue;
+      int k = map.FindIndex(made[i]);
+      if (k > 0 && !claimed[size_t(k - 1)]) {
+        face_index[i] = uint32_t(k - 1);
+        claimed[size_t(k - 1)] = true;
+      }
+    }
+    // A face the repair rebuilt (new edges) without recording it keeps its surface: the one unclaimed face on the
+    // same surface is it.
+    std::map<const Geom_Surface*, std::vector<int>> on_surface;
+    for (int k = 1; k <= map.Extent(); ++k) {
+      if (claimed[size_t(k - 1)]) continue;
+      TopLoc_Location loc;
+      Handle(Geom_Surface) g = BRep_Tool::Surface(TopoDS::Face(map(k)), loc);
+      if (!g.IsNull()) on_surface[g.get()].push_back(k);
+    }
+    std::map<const Geom_Surface*, int> wanted;
+    for (size_t i = 0; i < nfaces && i < made.size(); ++i) {
+      if (face_index[i] != UINT32_MAX || made[i].IsNull() || made[i].ShapeType() != TopAbs_FACE) continue;
+      TopLoc_Location loc;
+      Handle(Geom_Surface) g = BRep_Tool::Surface(TopoDS::Face(made[i]), loc);
+      if (!g.IsNull()) wanted[g.get()] += 1;
+    }
+    for (size_t i = 0; i < nfaces && i < made.size(); ++i) {
+      if (face_index[i] != UINT32_MAX || made[i].IsNull() || made[i].ShapeType() != TopAbs_FACE) continue;
+      TopLoc_Location loc;
+      Handle(Geom_Surface) g = BRep_Tool::Surface(TopoDS::Face(made[i]), loc);
+      auto it = g.IsNull() ? on_surface.end() : on_surface.find(g.get());
+      if (it != on_surface.end() && it->second.size() == 1 && wanted[g.get()] == 1) face_index[i] = uint32_t(it->second[0] - 1);
+    }
     *out = new SkShape{s};
     return 0;
   });

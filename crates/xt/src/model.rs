@@ -22,6 +22,8 @@ pub struct Body {
     pub color: Option<[f32; 3]>,
     /// Every attribute on the body: definition name → values (strings, numbers).
     pub attributes: Vec<Attribute>,
+    /// Each face's node id, in the order of `brep.faces`: what the file's own records call the face by.
+    pub face_ids: Vec<i64>,
     /// The triangles of faces that lie on a MESH surface (a facet body: an imported STL Shapr3D kept as a mesh).
     pub mesh: Option<Mesh>,
 }
@@ -764,6 +766,7 @@ fn body(f: &XtFile, n: &Node) -> Result<Body> {
         }
     }
     let mut mesh: Option<Mesh> = None;
+    let mut face_ids = Vec::new();
     for face in face_nodes {
         if let Some(surf) = cx.node(cx.ptr(face, "surface"))
             && f.type_name(surf.ty) == "MESH"
@@ -774,6 +777,10 @@ fn body(f: &XtFile, n: &Node) -> Result<Body> {
         let fi = cx.b.faces.len();
         let built = cx.face(face)?;
         cx.b.faces.push(built);
+        face_ids.push(match f.field(face, "node_id") {
+            Some(Val::Int(id)) => *id,
+            _ => -1,
+        });
         let shell = cx.ptr(face, "shell");
         match shells.iter_mut().find(|(s, _)| *s == shell) {
             Some((_, v)) => v.push(fi),
@@ -793,8 +800,8 @@ fn body(f: &XtFile, n: &Node) -> Result<Body> {
         Some(AttrValue::Reals(r)) if r.len() >= 3 => Some([r[0] as f32, r[1] as f32, r[2] as f32]),
         _ => None,
     });
-    join_split_walls(&mut cx.b);
-    Ok(Body { node: n.index, brep: cx.b, name, color, attributes, mesh })
+    join_split_walls(&mut cx.b, &mut face_ids);
+    Ok(Body { node: n.index, brep: cx.b, name, color, attributes, face_ids, mesh })
 }
 
 /// A clamped B-spline surface value at `(u, v)`, for comparing two surfaces' geometry.
@@ -893,8 +900,9 @@ fn loop_closes(b: &Brep, fins: &[Fin]) -> bool {
 /// Some files store a closed wall as two faces that share both of the wall's seam edges: one carries the top
 /// rim, the other the bottom rim and the holes. Neither closes on its own (the first has no far rim to bound it),
 /// so the shell comes out invalid. Join each such pair into the one face the geometry describes, as the STEP form
-/// of the same body has it: both seam edges stay, one on each side of the parameter rectangle.
-fn join_split_walls(b: &mut Brep) {
+/// of the same body has it: both seam edges stay, one on each side of the parameter rectangle. `face_ids` (one per
+/// face) loses the joined-away face's entry with it.
+fn join_split_walls(b: &mut Brep, face_ids: &mut Vec<i64>) {
     loop {
         let mut found = None;
         'shells: for shell in &b.shells {
@@ -920,6 +928,9 @@ fn join_split_walls(b: &mut Brep) {
             fin.pcurve = None;
         }
         b.faces.remove(keep);
+        if keep < face_ids.len() {
+            face_ids.remove(keep);
+        }
         for shell in &mut b.shells {
             shell.retain(|&f| f != keep);
             for f in shell.iter_mut() {
@@ -1083,8 +1094,10 @@ mod tests {
             shells: vec![vec![0, 1]],
             ..Brep::default()
         };
-        join_split_walls(&mut b);
+        let mut ids = vec![10, 11];
+        join_split_walls(&mut b, &mut ids);
         assert_eq!(b.faces.len(), 1, "the two halves join into one face");
+        assert_eq!(ids, [11], "the joined face keeps the id of the face that holds the holes");
         assert_eq!(b.faces[0].loops.len(), 2, "the hole survives");
         let outer: Vec<usize> = b.faces[0].loops[0].iter().map(|f| f.edge).collect();
         assert_eq!(outer, [0, 1, 2, 3, 4, 5], "both rims and both seams, each seam once");

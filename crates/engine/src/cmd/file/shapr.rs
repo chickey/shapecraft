@@ -215,17 +215,31 @@ fn add_shapr_body(
                 None => Vec::new(),
             }
         }
-        _ => match ready {
-            Some(ready) => {
-                let ready = ready?;
-                let id = add_meshed_body(s, ready.shape, ready.mesh, body.name.as_deref());
-                if let Some(print) = ready.print {
-                    prints.insert(id, print);
+        _ => {
+            let (made, faces) = match ready {
+                Some(ready) => {
+                    let ready = ready?;
+                    let id = add_meshed_body(s, ready.shape, ready.mesh, body.name.as_deref());
+                    if let Some(print) = ready.print {
+                        prints.insert(id, print);
+                    }
+                    (vec![id], ready.faces)
                 }
-                vec![id]
+                None => {
+                    let (shape, faces) = build_shape(s.kernel.as_ref(), &body.brep)?;
+                    (add_bodies(s, vec![shape], body.name.as_deref())?, faces)
+                }
+            };
+            // Faces painted their own colour in the file keep it, on the faces the kernel made of them.
+            let painted: Vec<(u32, [f32; 3])> =
+                body.brep.faces.iter().zip(&faces).filter_map(|(f, at)| Some(((*at)?, f.color?))).take(10_000).collect();
+            if let ([id], false) = (made.as_slice(), painted.is_empty())
+                && let Some(b) = s.doc.body_mut(*id)
+            {
+                b.face_colors = painted;
             }
-            None => add_bodies(s, vec![s.kernel.from_brep(&body.brep)?], body.name.as_deref())?,
-        },
+            made
+        }
     };
     if let (Some(step), [id]) = (body.step, made.as_slice()) {
         links.push((*id, step, body.item_name_id));
@@ -323,6 +337,16 @@ struct Ready {
     shape: shapecraft_kernel::Shape,
     mesh: shapecraft_kernel::Mesh,
     print: Option<(Vec<f64>, bool)>,
+    /// Which of the shape's faces each of the body's faces became (only worked out for a body with painted faces).
+    faces: Vec<Option<u32>>,
+}
+
+/// A body's shape, and (when some of its faces have their own colour) which of the shape's faces each became.
+fn build_shape(
+    kernel: &dyn shapecraft_kernel::Kernel,
+    brep: &shapecraft_kernel::brep::Brep,
+) -> shapecraft_kernel::Result<(shapecraft_kernel::Shape, Vec<Option<u32>>)> {
+    if brep.faces.iter().any(|f| f.color.is_some()) { kernel.from_brep_faces(brep) } else { Ok((kernel.from_brep(brep)?, Vec::new())) }
 }
 
 /// Each exact body rebuilt, triangulated and (with `prints`, those a step made) measured, on up to eight cores: one
@@ -332,14 +356,14 @@ fn prepare(s: &Session, bodies: &[shapecraft_shapr::Body], prints: bool) -> Vec<
     let kernel: &dyn shapecraft_kernel::Kernel = s.kernel.as_ref();
     let deflection = shapecraft_doc::project::deflection();
     let build = |body: &shapecraft_shapr::Body| -> shapecraft_kernel::Result<Ready> {
-        let shape = kernel.from_brep(&body.brep)?;
+        let (shape, faces) = build_shape(kernel, &body.brep)?;
         let mesh = kernel.tessellate(&shape, deflection)?;
         let print = (prints && body.step.is_some())
             .then(|| {
                 kernel.mass_props_within(&shape, EXACT_SECONDS).ok().and_then(|(m, mesh)| Some((print_with(kernel, &shape, m).ok()?, mesh)))
             })
             .flatten();
-        Ok(Ready { shape, mesh, print })
+        Ok(Ready { shape, mesh, print, faces })
     };
     let wanted = |body: &shapecraft_shapr::Body| !(body.mesh.is_some() && body.brep.faces.is_empty());
     let mut out: Vec<Option<shapecraft_kernel::Result<Ready>>> = bodies.iter().map(|_| None).collect();

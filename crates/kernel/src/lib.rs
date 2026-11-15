@@ -540,6 +540,13 @@ pub trait Kernel: Send + Sync {
         Err(KernelError::Operation { op: "from_brep", message: "not supported by this kernel".into() })
     }
 
+    /// [`Kernel::from_brep`], and which of the shape's faces (as tessellation numbers them) each of `brep.faces`
+    /// became; `None` where that isn't known (the repair split, merged or dropped it, or the kernel can't tell).
+    #[allow(clippy::wrong_self_convention)] // the kernel instance builds it
+    fn from_brep_faces(&self, brep: &brep::Brep) -> Result<(Shape, Vec<Option<u32>>)> {
+        Ok((self.from_brep(brep)?, vec![None; brep.faces.len()]))
+    }
+
     /// The shape as text the same kernel reads back exactly ([`Kernel::shape_from_text`]): frozen geometry kept in
     /// the history (an Unlinked Copy).
     fn shape_to_text(&self, _shape: &Shape) -> Result<String> {

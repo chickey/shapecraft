@@ -80,10 +80,6 @@ struct Body {
     // x: whole body selected, y: hovered face + 1 (0 = none), z: number of selected faces, w: body hovered
     flags: vec4<u32>,
     sel: array<vec4<u32>, 4>,
-    // x: number of painted faces
-    paint: vec4<u32>,
-    paint_faces: array<vec4<u32>, 4>,
-    paint_colors: array<vec4<f32>, 16>,
 };
 @group(1) @binding(0) var<uniform> b: Body;
 
@@ -92,6 +88,8 @@ struct MeshIn {
     @location(1) normal: vec3<f32>,
     @location(2) face: u32,
     @location(3) curv: f32,
+    // A face painted its own colour (linear rgb; a = 1), else a = 0.
+    @location(4) paint: vec4<f32>,
 };
 
 struct MeshOut {
@@ -100,6 +98,7 @@ struct MeshOut {
     @location(1) @interpolate(flat) face: u32,
     @location(2) world: vec3<f32>,
     @location(3) @interpolate(flat) curv: f32,
+    @location(4) @interpolate(flat) paint: vec4<f32>,
 };
 
 @vertex
@@ -112,6 +111,7 @@ fn vs_mesh(v: MeshIn) -> MeshOut {
     o.face = v.face;
     o.world = v.pos;
     o.curv = v.curv;
+    o.paint = v.paint;
     return o;
 }
 
@@ -161,12 +161,7 @@ fn fs_mesh(v: MeshOut) -> @location(0) vec4<f32> {
     let key = pow(max(dot(n, normalize(g.light.xyz)), 0.0), 1.5);
     let top = pow(1.0 / length(g.light.xyz) * g.light.z, 1.5);
     let shade = (0.08 + 0.92 * key) / (0.08 + 0.92 * top);
-    var base = b.color.rgb;
-    for (var k = 0u; k < min(b.paint.x, 16u); k = k + 1u) {
-        if (b.paint_faces[k / 4u][k % 4u] == v.face) {
-            base = b.paint_colors[k].rgb;
-        }
-    }
+    var base = select(b.color.rgb, v.paint.rgb, v.paint.a > 0.5);
     // Surface analysis replaces the colour (selection still shows).
     if (g.analysis.x > 0.5 && !face_selected(v.face) && b.flags.x == 0u) {
         if (g.analysis.x < 1.5) {

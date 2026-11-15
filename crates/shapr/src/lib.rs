@@ -369,11 +369,12 @@ impl Project {
         p.sketches = sketches(c)?;
         p.extrudes = extrudes(c, &p.steps, &p.items)?;
         let unreadable;
-        (p.bodies, unreadable) = current_bodies(c)?;
+        let paint = FacePaint::read(c, &p.steps)?;
+        (p.bodies, unreadable) = current_bodies(c, &paint)?;
         let gone = drop_removed(c, &p.steps, &mut Vec::new())?;
         // Imported bodies the file keeps no revision data for (it keeps revision blocks only for bodies that were
         // rebuilt): they come from their prototypes, beside the cached ones, so the project opens complete.
-        let (extra_bodies, extra_unreadable) = uncovered_import_bodies(c, &p.steps, &gone)?;
+        let (extra_bodies, extra_unreadable) = uncovered_import_bodies(c, &p.steps, &gone, &paint)?;
         p.bodies.extend(extra_bodies);
         name_bodies(c, &p.steps, &p.items, &p.folders, &gone, &mut p.bodies)?;
         apply_moves(c, &p.steps, &mut p.bodies)?;
@@ -1515,7 +1516,7 @@ fn has_table(c: &rusqlite::Connection, name: &str) -> bool {
 type Unreadable = Vec<(Option<i64>, String)>;
 
 /// The solids of the cached partitions; the imported prototypes when no partition is cached.
-fn current_bodies(c: &rusqlite::Connection) -> Result<(Vec<Body>, Unreadable)> {
+fn current_bodies(c: &rusqlite::Connection, paint: &FacePaint) -> Result<(Vec<Body>, Unreadable)> {
     let mut parts: BTreeMap<i64, Vec<(i64, Vec<u8>)>> = BTreeMap::new();
     if has_table(c, "BodyRevisionBlocks") {
         let mut q = c.prepare("SELECT PartitionID, ChunkIndex, Block FROM BodyRevisionBlocks WHERE IsDeleted = 0 AND Phase = 2")?;
@@ -1593,6 +1594,7 @@ fn current_bodies(c: &rusqlite::Connection) -> Result<(Vec<Body>, Unreadable)> {
         let (t, import) = t.map_or((None, None), |(t, id)| (Some(t), Some(id)));
         let motion = t.as_deref().and_then(rigid);
         for mut body in read(&b, partition) {
+            paint.apply(&mut body, import.or_else(|| partition.and_then(|pid| paint.import_of.get(&pid).copied())));
             if let Some((rot, shift)) = motion {
                 body.brep.transform_rigid(rot, shift);
                 if let Some(m) = &mut body.mesh {
@@ -1616,6 +1618,73 @@ fn current_bodies(c: &rusqlite::Connection) -> Result<(Vec<Body>, Unreadable)> {
     Ok((out, unreadable))
 }
 
+/// Colours set on single faces of imported bodies (a STEP file's per-face colours come in this way). Each one is a
+/// material set on a name the import step gave the face, `[11] {bodyID, identifier}`: the imported body and the
+/// face's node id in it, which the body keeps in the partitions made from it. The newest setting of a face wins.
+#[derive(Default)]
+struct FacePaint {
+    /// Imported body → face node id → colour (0–1).
+    colours: BTreeMap<i64, BTreeMap<i64, [f32; 3]>>,
+    /// Partition the import step made → its imported body.
+    import_of: BTreeMap<i64, i64>,
+}
+
+impl FacePaint {
+    fn read(c: &rusqlite::Connection, steps: &[Step]) -> Result<Self> {
+        let mut paint = FacePaint::default();
+        if !has_table(c, "MaterialInstances") || !has_table(c, "HistoryNames") || !has_table(c, "MetadataAssignments") {
+            return Ok(paint);
+        }
+        paint.import_of = import_slots(c, steps)?.into_iter().filter_map(|(id, pid)| Some((pid?, id))).collect();
+        let mut palette: BTreeMap<String, Option<[f32; 3]>> = BTreeMap::new();
+        {
+            let mut q = c.prepare("SELECT InstanceID, Properties FROM MaterialInstances")?;
+            for (id, props) in q.query_map([], |r| Ok((r.get::<_, i64>(0)?, blob(r.get(1)?))))?.flatten().take(100_000) {
+                let Some(rgba) = unpack(&props).and_then(|v| v.as_array()?.first()?.as_u64()) else { continue };
+                let rgb = (rgba >> 8) as u32 & 0xFF_FFFF;
+                // The default grey is no colour: the body's own shows.
+                let colour = (rgb != 0xA0_A0A4)
+                    .then(|| [(rgb >> 16) as f32 / 255.0, ((rgb >> 8) & 0xFF) as f32 / 255.0, (rgb & 0xFF) as f32 / 255.0]);
+                palette.insert(id.to_string(), colour);
+            }
+        }
+        let mut name = c.prepare("SELECT Type, Data FROM HistoryNames WHERE NameID = ?1")?;
+        let mut json = |id: i64| -> Option<(i64, serde_json::Value)> {
+            let (ty, data) = name.query_row([id], |r| Ok((r.get::<_, i64>(0)?, text(r.get(1)?)))).ok()?;
+            Some((ty, serde_json::from_str(&data).ok()?))
+        };
+        let mut q = c.prepare(
+            "SELECT a.NameID, m.Data FROM MetadataAssignments a JOIN Metadata m ON m.MetadataID = a.MetadataID \
+             WHERE m.MetadataTypeID = 2 ORDER BY m.MetadataID",
+        )?;
+        let rows: Vec<(i64, String)> = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, text(r.get(1)?))))?.flatten().take(1_000_000).collect();
+        for (anchor, instance) in rows {
+            let Some(colour) = palette.get(instance.trim()) else { continue };
+            let Some((18, a)) = json(anchor) else { continue };
+            let Some((0, face)) = a["nameToAnchor"].as_i64().and_then(&mut json) else { continue };
+            let [source] = face["sourceTopologyNames"].as_array().map(Vec::as_slice).unwrap_or_default() else { continue };
+            let Some((11, imported)) = source.as_i64().and_then(&mut json) else { continue };
+            let (Some(body), Some(id)) = (imported["bodyID"].as_i64(), imported["identifier"].as_i64()) else { continue };
+            let faces = paint.colours.entry(body).or_default();
+            match colour {
+                Some(c) => faces.insert(id, *c),
+                None => faces.remove(&id),
+            };
+        }
+        Ok(paint)
+    }
+
+    /// Paints the faces of a body read from `import`'s prototype or from a partition made from it.
+    fn apply(&self, body: &mut shapecraft_xt::Body, import: Option<i64>) {
+        let Some(colours) = import.and_then(|i| self.colours.get(&i)) else { return };
+        for (face, id) in body.brep.faces.iter_mut().zip(&body.face_ids) {
+            if let Some(colour) = colours.get(id) {
+                face.color = Some(*colour);
+            }
+        }
+    }
+}
+
 /// The imports whose body the file keeps no revision data for, so it has to come from its prototype: the file keeps
 /// revision blocks only for bodies that were rebuilt, and an import nothing touched afterwards has none.
 ///
@@ -1636,6 +1705,16 @@ fn uncovered_imports(c: &rusqlite::Connection, steps: &[Step], gone: &std::colle
             let mut q = c.prepare(&format!("SELECT DISTINCT PartitionID FROM {table}"))?;
             known.extend(q.query_map([], |r| r.get::<_, i64>(0))?.flatten().take(10_000_000));
         }
+    }
+    Ok(import_slots(c, steps)?.into_iter().filter(|(_, pid)| pid.is_some_and(|pid| !known.contains(&pid))).map(|(id, _)| id).collect())
+}
+
+/// Each import's imported body and the partition the import step made for it, when the step's call records one: the
+/// step's k-th created partition (by creation index) belongs to its k-th import. Only calls in the newer layout (more
+/// than three slots) record them.
+fn import_slots(c: &rusqlite::Connection, steps: &[Step]) -> Result<Vec<(i64, Option<i64>)>> {
+    if !has_table(c, "PersistedCalls") {
+        return Ok(Vec::new());
     }
     let mut step_parts: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     {
@@ -1685,9 +1764,7 @@ fn uncovered_imports(c: &rusqlite::Connection, steps: &[Step], gone: &std::colle
         let mut ids = Vec::new();
         step.params.iter().for_each(|(_, v)| import_id(v, &mut ids));
         for (k, id) in ids.into_iter().enumerate() {
-            if partitions.get(k).is_some_and(|pid| !known.contains(pid)) {
-                out.push(id);
-            }
+            out.push((id, partitions.get(k).copied()));
         }
     }
     Ok(out)
@@ -1698,6 +1775,7 @@ fn uncovered_import_bodies(
     c: &rusqlite::Connection,
     steps: &[Step],
     gone: &std::collections::HashSet<i64>,
+    paint: &FacePaint,
 ) -> Result<(Vec<Body>, Unreadable)> {
     if !has_table(c, "HistoryImportedPrototypes") || !has_table(c, "HistoryImportedBodies") {
         return Ok((Vec::new(), Vec::new()));
@@ -1726,6 +1804,7 @@ fn uncovered_import_bodies(
         match shapecraft_xt::parse(data).and_then(|f| shapecraft_xt::bodies(&f)) {
             Ok(bodies) => {
                 for mut body in bodies {
+                    paint.apply(&mut body, Some(import_id));
                     if let Some((rot, shift)) = motion {
                         body.brep.transform_rigid(rot, shift);
                         if let Some(m) = &mut body.mesh {
@@ -1808,6 +1887,56 @@ mod identity_tests {
         // A file in the older layout keeps whole partitions in their own table.
         c.execute_batch("CREATE TABLE BodyRevisionPartitions (PartitionID INTEGER, Block BLOB); INSERT INTO BodyRevisionPartitions VALUES (100, x'00');")?;
         assert!(uncovered_imports(&c, &steps, &gone)?.is_empty());
+        Ok(())
+    }
+
+    /// A colour set on one face of an imported body reaches that face (by its node id), the newest setting winning and
+    /// the default grey taking the colour away again; a body made from another import is left alone.
+    #[test]
+    fn face_colours_reach_the_faces_they_were_set_on() -> Result<()> {
+        let c = rusqlite::Connection::open_in_memory()?;
+        c.execute_batch(
+            "CREATE TABLE MaterialInstances (InstanceID INTEGER, DefinitionID INTEGER, Properties BLOB);
+             CREATE TABLE HistoryNames (NameID INTEGER, Type INT, Data BLOB, Version INT);
+             CREATE TABLE MetadataAssignments (RowID INTEGER, NameID INTEGER, MetadataID INTEGER);
+             CREATE TABLE Metadata (MetadataID INTEGER, MetadataTypeID INT, Data BLOB);",
+        )?;
+        for (id, rgba) in [(5u64, 0x0000_00FFu64), (6, 0xA0A0_A4FF), (7, 0xFF00_00FF)] {
+            c.execute("INSERT INTO MaterialInstances VALUES (?1, 0, ?2)", (id as i64, pack(&Value::Array(vec![Value::from(rgba)]))))?;
+        }
+        // Two faces of imported body 9 (node ids 42 and 43), each named by the import and anchored.
+        for (base, face) in [(300, 42), (310, 43)] {
+            let names = [
+                (base, 11, format!(r#"{{"bodyID":9,"identifier":{face}}}"#)),
+                (base + 1, 0, format!(r#"{{"qualifier":0,"sourceTopologyNames":[{base}]}}"#)),
+                (base + 2, 18, format!(r#"{{"nameToAnchor":{}}}"#, base + 1)),
+            ];
+            for (id, ty, data) in names {
+                c.execute("INSERT INTO HistoryNames VALUES (?1, ?2, ?3, 1)", (id, ty, data))?;
+            }
+        }
+        // Red, then black, on face 42; red, then the default grey, on face 43.
+        for (mid, instance, anchor) in [(1000, "7", 302), (1001, "5", 302), (1002, "7", 312), (1003, "6", 312)] {
+            c.execute("INSERT INTO Metadata VALUES (?1, 2, ?2)", (mid, instance))?;
+            c.execute("INSERT INTO MetadataAssignments VALUES (?1, ?2, ?1)", (mid, anchor))?;
+        }
+        let paint = FacePaint::read(&c, &[])?;
+        let face = || shapecraft_kernel::brep::Face { surface: 0, flip: false, loops: vec![], color: None };
+        let body = |face_ids: Vec<i64>| shapecraft_xt::Body {
+            node: 1,
+            brep: Brep { faces: vec![face(), face(), face()], ..Brep::default() },
+            name: None,
+            color: None,
+            attributes: vec![],
+            face_ids,
+            mesh: None,
+        };
+        let mut ours = body(vec![42, 43, 44]);
+        paint.apply(&mut ours, Some(9));
+        assert_eq!(ours.brep.faces.iter().map(|f| f.color).collect::<Vec<_>>(), vec![Some([0.0, 0.0, 0.0]), None, None]);
+        let mut other = body(vec![42, 43, 44]);
+        paint.apply(&mut other, Some(8));
+        assert!(other.brep.faces.iter().all(|f| f.color.is_none()));
         Ok(())
     }
 

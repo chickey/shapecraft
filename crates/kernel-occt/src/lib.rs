@@ -1024,6 +1024,16 @@ impl Kernel for OcctKernel {
         shape_out("B-rep import", |out| unsafe { ffi::sk_from_brep(data.as_ptr(), data.len(), out) })
     }
 
+    fn from_brep_faces(&self, brep: &shapecraft_kernel::brep::Brep) -> Result<(Shape, Vec<Option<u32>>)> {
+        let data = shapecraft_kernel::brep::flat::encode(brep);
+        let mut index = vec![u32::MAX; brep.faces.len()];
+        // SAFETY: `data` outlives the call and is bounds-checked by the shim; `index` holds one slot per face.
+        let shape = shape_out("B-rep import", |out| unsafe {
+            ffi::sk_from_brep_faces(data.as_ptr(), data.len(), out, index.as_mut_ptr(), index.len())
+        })?;
+        Ok((shape, index.into_iter().map(|i| (i != u32::MAX).then_some(i)).collect()))
+    }
+
     fn shape_to_text(&self, shape: &Shape) -> Result<String> {
         let s = raw(shape)?;
         // SAFETY: `s` is a live shape; the text stays in the shim's thread-local until its next call on this thread.

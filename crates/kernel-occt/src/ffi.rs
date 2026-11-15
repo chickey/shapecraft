@@ -61,6 +61,7 @@ unsafe extern "C" {
     pub fn sk_from_mesh(xyz: *const f64, nverts: usize, idx: *const u32, ntris: usize, out: *mut *mut SkShape) -> i32;
     pub fn sk_shape_array_free(arr: *mut *mut SkShape);
     pub fn sk_from_brep(data: *const f64, n: usize, out: *mut *mut SkShape) -> i32;
+    pub fn sk_from_brep_faces(data: *const f64, n: usize, out: *mut *mut SkShape, face_index: *mut u32, nfaces: usize) -> i32;
     pub fn sk_to_brep(s: *const SkShape, out: *mut *mut f64, n: *mut usize) -> i32;
     pub fn sk_doubles_free(d: *mut f64);
     pub fn sk_mesh_edge_face(m: *const SkMesh, i: usize, side: usize) -> u32;

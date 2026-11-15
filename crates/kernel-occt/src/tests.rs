@@ -834,6 +834,24 @@ fn used_offset_accepts_a_sweep_that_changes_speed_at_a_full_knot() {
     assert!(err.contains("offset of a C0 surface"), "{err}");
 }
 
+/// Each face of the stream is told apart in the shape it builds: the faces a filleted block comes back with all map, each
+/// to a face of its own.
+#[test]
+fn from_brep_faces_says_which_face_each_became() {
+    let k = k();
+    let block = k.extrude_polygon(&rect(20.0, 10.0), DVec3::new(0.0, 0.0, 8.0)).unwrap();
+    let rounded = k.fillet_all_edges(&block, 2.0).unwrap();
+    let brep = k.to_brep(&rounded).unwrap().remove(0);
+    let (shape, faces) = k.from_brep_faces(&brep).unwrap();
+    assert_eq!(faces.len(), brep.faces.len());
+    let mut seen: Vec<u32> = faces.iter().map(|f| f.unwrap()).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), brep.faces.len());
+    assert_eq!(k.face_count(&shape).unwrap() as usize, brep.faces.len());
+    assert!(seen.iter().all(|&f| (f as usize) < brep.faces.len()));
+}
+
 #[test]
 fn brep_round_trip_keeps_curved_solids() {
     let k = k();

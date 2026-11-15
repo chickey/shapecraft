@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -17,7 +18,8 @@ pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth3
 pub(crate) const SAMPLES: u32 = 4;
 const MAX_SELECTED_FACES: usize = 16;
 
-const MESH_ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32, 3 => Float32];
+const MESH_ATTRS: [wgpu::VertexAttribute; 5] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32, 3 => Float32, 4 => Float32x4];
 const LINE_ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4];
 const DOT_ATTRS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x4];
 const FILL_ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
@@ -84,14 +86,7 @@ struct BodyUniform {
     material: [f32; 4],
     flags: [u32; 4],
     sel: [u32; MAX_SELECTED_FACES],
-    /// x: number of painted faces (up to MAX_PAINTED).
-    paint: [u32; 4],
-    paint_faces: [u32; MAX_PAINTED],
-    paint_colors: [[f32; 4]; MAX_PAINTED],
 }
-
-/// Faces per body that can carry their own color on the GPU.
-const MAX_PAINTED: usize = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -101,6 +96,8 @@ struct MeshVertex {
     face: u32,
     /// The triangle's Gaussian curvature (for the Curvature Map).
     curv: f32,
+    /// The face's own colour (linear, a = 1) when it is painted, else zero: any number of faces, unlike a uniform.
+    paint: [f32; 4],
 }
 
 #[repr(C)]
@@ -129,6 +126,8 @@ struct FillVertex {
 
 struct BodyGpu {
     mesh: Arc<Mesh>,
+    /// The painted faces the vertices were made with.
+    paint_key: u64,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     count: u32,
@@ -863,10 +862,17 @@ impl Renderer {
         self.generation += 1;
     }
 
-    fn body_gpu(&mut self, id: usize, mesh: &Arc<Mesh>) -> Option<&mut BodyGpu> {
-        let stale = self.bodies.get(&id).is_none_or(|b| !Arc::ptr_eq(&b.mesh, mesh));
+    fn body_gpu(&mut self, id: usize, mesh: &Arc<Mesh>, face_colors: &[(u32, [f32; 3])]) -> Option<&mut BodyGpu> {
+        let paint_key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for (face, c) in face_colors {
+                (face, c.map(f32::to_bits)).hash(&mut h);
+            }
+            h.finish()
+        };
+        let stale = self.bodies.get(&id).is_none_or(|b| !Arc::ptr_eq(&b.mesh, mesh) || b.paint_key != paint_key);
         if stale {
-            let gpu = self.upload_body(mesh);
+            let gpu = self.upload_body(mesh, face_colors, paint_key);
             self.bodies.insert(id, gpu);
         }
         let b = self.bodies.get_mut(&id)?;
@@ -874,17 +880,20 @@ impl Renderer {
         Some(b)
     }
 
-    fn upload_body(&self, mesh: &Arc<Mesh>) -> BodyGpu {
+    fn upload_body(&self, mesh: &Arc<Mesh>, face_colors: &[(u32, [f32; 3])], paint_key: u64) -> BodyGpu {
+        let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let painted: HashMap<u32, [f32; 4]> = face_colors.iter().map(|(f, c)| (*f, [lin(c[0]), lin(c[1]), lin(c[2]), 1.0])).collect();
         // Faces are per triangle in the mesh but flat per vertex in the shader, so every triangle gets its
         // own three vertices.
         let mut verts = Vec::with_capacity(mesh.indices.len());
         for (t, tri) in mesh.indices.chunks(3).enumerate() {
             let face = mesh.triangle_faces.get(t).copied().unwrap_or(0);
             let curv = gaussian_curvature(mesh, tri);
+            let paint = painted.get(&face).copied().unwrap_or([0.0; 4]);
             for &i in tri {
                 if let Some(p) = mesh.positions.get(i as usize) {
                     let normal = mesh.normals.get(i as usize).copied().unwrap_or([0.0, 0.0, 1.0]);
-                    verts.push(MeshVertex { pos: *p, normal, face, curv });
+                    verts.push(MeshVertex { pos: *p, normal, face, curv, paint });
                 }
             }
         }
@@ -912,6 +921,7 @@ impl Renderer {
         });
         BodyGpu {
             mesh: mesh.clone(),
+            paint_key,
             vertices,
             indices: index_buf,
             count: indices.len() as u32,
@@ -1034,16 +1044,7 @@ impl Renderer {
                 material,
                 flags: [0; 4],
                 sel: [0; MAX_SELECTED_FACES],
-                paint: [0; 4],
-                paint_faces: [0; MAX_PAINTED],
-                paint_colors: [[0.0; 4]; MAX_PAINTED],
             };
-            let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
-            for (k, (face, c)) in body.face_colors.iter().take(MAX_PAINTED).enumerate() {
-                uni.paint_faces[k] = *face;
-                uni.paint_colors[k] = [lin(c[0]), lin(c[1]), lin(c[2]), 1.0];
-                uni.paint[0] = k as u32 + 1;
-            }
             let mut n = 0usize;
             for p in scene.selection {
                 match *p {
@@ -1065,7 +1066,7 @@ impl Renderer {
             if scene.hover == Some(Pick::Body { body: body.id }) {
                 uni.flags[3] = 1;
             }
-            let Some(gpu) = self.body_gpu(key, &body.mesh) else { continue };
+            let Some(gpu) = self.body_gpu(key, &body.mesh, &body.face_colors) else { continue };
             if body.mesh.bounds().is_some_and(|b| off_screen(&view_proj, b)) {
                 continue;
             }
