@@ -933,7 +933,23 @@ impl Kernel for OcctKernel {
                         p.split('\x1f').map(str::trim).filter(|x| !x.is_empty()).map(|x| x.chars().take(200).collect()).take(64).collect()
                     })
                     .unwrap_or_default();
-                (s, PartInfo { name, color, path })
+                // "face r g b" entries separated by 0x1E.
+                let face_colors = f
+                    .next()
+                    .map(|fc| {
+                        fc.split('\x1e')
+                            .filter_map(|e| {
+                                let mut v = e.split(' ');
+                                let face = v.next()?.parse::<u32>().ok()?;
+                                let c: Vec<f32> = v.filter_map(|x| x.parse().ok()).collect();
+                                (c.len() == 3 && c.iter().all(|x| x.is_finite()))
+                                    .then(|| (face, [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)]))
+                            })
+                            .take(100_000)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (s, PartInfo { name, color, path, face_colors })
             })
             .collect())
     }
@@ -961,10 +977,27 @@ impl Kernel for OcctKernel {
             })
             .collect();
         let path_ptrs: Vec<*const std::ffi::c_char> = paths.iter().map(|c| c.as_ptr()).collect();
+        // Each part's painted faces, flattened: face index, r, g, b.
+        let face_counts: Vec<usize> = parts.iter().map(|(_, i)| i.face_colors.len()).collect();
+        let faces: Vec<f64> = parts
+            .iter()
+            .flat_map(|(_, i)| i.face_colors.iter().flat_map(|(f, c)| [f64::from(*f), c[0].into(), c[1].into(), c[2].into()]))
+            .collect();
         let p = c_path(path)?;
-        // SAFETY: every array holds `parts.len()` entries (rgb three each) and outlives the call.
+        // SAFETY: every array holds `parts.len()` entries (rgb three each), `faces` four per counted face; all outlive
+        // the call.
         check("STEP export", unsafe {
-            ffi::sk_write_step_doc(ptrs.as_ptr(), name_ptrs.as_ptr(), rgb.as_ptr(), path_ptrs.as_ptr(), ptrs.len(), p.as_ptr(), schema)
+            ffi::sk_write_step_doc(
+                ptrs.as_ptr(),
+                name_ptrs.as_ptr(),
+                rgb.as_ptr(),
+                path_ptrs.as_ptr(),
+                face_counts.as_ptr(),
+                faces.as_ptr(),
+                ptrs.len(),
+                p.as_ptr(),
+                schema,
+            )
         })
     }
 
@@ -1022,6 +1055,14 @@ impl Kernel for OcctKernel {
         let data = shapecraft_kernel::brep::flat::encode(brep);
         // SAFETY: `data` outlives the call; the shim bounds-checks every read against `data.len()`.
         shape_out("B-rep import", |out| unsafe { ffi::sk_from_brep(data.as_ptr(), data.len(), out) })
+    }
+
+    fn match_faces(&self, before: &Shape, after: &Shape) -> Result<Vec<Option<u32>>> {
+        let (a, b) = (raw(before)?, raw(after)?);
+        let mut index = vec![u32::MAX; self.face_count(after)? as usize];
+        // SAFETY: both shapes are alive; `index` holds one slot per face of `after`.
+        check("match faces", unsafe { ffi::sk_match_faces(a, b, index.as_mut_ptr(), index.len()) })?;
+        Ok(index.into_iter().map(|i| (i != u32::MAX).then_some(i)).collect())
     }
 
     fn from_brep_faces(&self, brep: &shapecraft_kernel::brep::Brep) -> Result<(Shape, Vec<Option<u32>>)> {

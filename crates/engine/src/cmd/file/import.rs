@@ -376,14 +376,18 @@ fn import_step(s: &mut Session, path: &std::path::Path, heal: shapecraft_kernel:
     // Everything lands in a folder named after the file, parts of assemblies in folders below it.
     let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     // Parts are "Imported 01", "02"… in each file, whatever the file calls them.
-    for (k, (shape, mut info)) in parts.into_iter().enumerate() {
-        let shape = healed(s, &shape, heal, &mut cut)?;
+    for (k, (read, mut info)) in parts.into_iter().enumerate() {
+        let shape = healed(s, &read, heal, &mut cut)?;
+        let face_colors = repaired_face_colors(s, &read, &shape, &info.face_colors);
         let name = format!("Imported {:02}", k + 1);
         let made = add_bodies(s, vec![shape], Some(&name))?;
         info.path.insert(0, file.clone());
         for &id in &made {
             if let (Some(c), Some(b)) = (info.color, s.doc.body_mut(id)) {
                 b.appearance = Some(shapecraft_doc::Appearance { name: "Imported Color".into(), color: c, ..Default::default() });
+            }
+            if let (false, Some(b)) = (face_colors.is_empty(), s.doc.body_mut(id)) {
+                b.face_colors = face_colors.clone();
             }
             match folders.iter_mut().find(|f| f.0 == info.path) {
                 Some(f) => f.1.push(id),
@@ -398,6 +402,25 @@ fn import_step(s: &mut Session, path: &std::path::Path, heal: shapecraft_kernel:
     // Nothing is selected after an import.
     s.selection.clear();
     Ok(json!({ "bodies": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "folders": made_folders, "repair_cut": cut }))
+}
+
+/// The faces of a part the file colours one by one, on the faces of its repaired shape: the repair may renumber, split
+/// or merge faces, so each repaired face takes the colour of the face it came from.
+fn repaired_face_colors(
+    s: &Session,
+    read: &shapecraft_kernel::Shape,
+    repaired: &shapecraft_kernel::Shape,
+    colors: &[(u32, [f32; 3])],
+) -> Vec<(u32, [f32; 3])> {
+    if colors.is_empty() {
+        return Vec::new();
+    }
+    if read.ptr_eq(repaired) {
+        return colors.iter().copied().take(10_000).collect();
+    }
+    let by_face: std::collections::HashMap<u32, [f32; 3]> = colors.iter().copied().collect();
+    let from = s.kernel.match_faces(read, repaired).unwrap_or_default();
+    from.iter().enumerate().filter_map(|(face, was)| Some((face as u32, *by_face.get(&(*was)?)?))).take(10_000).collect()
 }
 
 /// Seconds the repair of one imported shape may take before it is cut short (#21).

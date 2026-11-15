@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -132,6 +133,8 @@
 #include <Quantity_Color.hxx>
 #include <TCollection_ExtendedString.hxx>
 #include <STEPControl_Writer.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
+#include <Geom_Surface.hxx>
 #include <XSControl_WorkSession.hxx>
 #include <DESTEP_Parameters.hxx>
 #include <StepData_StepModel.hxx>
@@ -653,7 +656,38 @@ struct Part {
   bool colored;
   Quantity_Color color;
   std::vector<std::string> path;
+  // Faces with a colour of their own other than the part's: (face index among the shape's faces, colour).
+  std::vector<std::pair<int, Quantity_Color>> faces;
 };
+
+// The colours a part's shape label gives single faces of `solid` (its sub-shape labels: faces, or shells and
+// solids standing for all their faces), by the face's index among the solid's faces.
+std::vector<std::pair<int, Quantity_Color>> face_colors(const Handle(XCAFDoc_ShapeTool)& st, const Handle(XCAFDoc_ColorTool)& ct,
+                                                       const TDF_Label& ref, const TopoDS_Shape& solid) {
+  std::vector<std::pair<int, Quantity_Color>> out;
+  TDF_LabelSequence subs;
+  st->GetSubShapes(ref, subs);
+  if (subs.IsEmpty()) return out;
+  TopTools_IndexedMapOfShape faces;
+  TopExp::MapShapes(solid, TopAbs_FACE, faces);
+  std::vector<int> at(size_t(faces.Extent()), -1);
+  for (Standard_Integer i = 1; i <= subs.Length(); ++i) {
+    Quantity_Color c;
+    if (!label_color(ct, subs.Value(i), c)) continue;
+    TopoDS_Shape sub = st->GetShape(subs.Value(i));
+    for (TopExp_Explorer ex(sub, TopAbs_FACE); ex.More(); ex.Next()) {
+      int k = faces.FindIndex(ex.Current());
+      if (k <= 0) continue;
+      if (at[size_t(k - 1)] < 0) {
+        at[size_t(k - 1)] = int(out.size());
+        out.push_back({k - 1, c});
+      } else if (sub.ShapeType() == TopAbs_FACE) {
+        out[size_t(at[size_t(k - 1)])].second = c;  // a face's own colour wins over its shell's
+      }
+    }
+  }
+  return out;
+}
 
 void walk(const Handle(XCAFDoc_ShapeTool)& st, const Handle(XCAFDoc_ColorTool)& ct, const TDF_Label& label, const TopLoc_Location& loc,
           std::vector<std::string> path, bool colored, Quantity_Color color, std::vector<Part>& out, int depth) {
@@ -681,7 +715,7 @@ void walk(const Handle(XCAFDoc_ShapeTool)& st, const Handle(XCAFDoc_ColorTool)& 
   for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) solids.push_back(ex.Current());
   if (solids.empty()) solids.push_back(shape);
   for (size_t k = 0; k < solids.size(); ++k) {
-    Part p{solids[k].Moved(here), name, colored, color, path};
+    Part p{solids[k].Moved(here), name, colored, color, path, {}};
     // A solid of its own inside the part may carry its own name and color.
     TDF_Label sub;
     if (solids.size() > 1 && st->FindSubShape(ref, solids[k], sub)) {
@@ -694,6 +728,8 @@ void walk(const Handle(XCAFDoc_ShapeTool)& st, const Handle(XCAFDoc_ColorTool)& 
       }
     }
     if (solids.size() > 1 && p.name == name && !name.empty()) p.name = name + " (" + std::to_string(k + 1) + ")";
+    for (auto& f : face_colors(st, ct, ref, solids[k]))
+      if (!p.colored || !f.second.IsEqual(p.color)) p.faces.push_back(f);
     out.push_back(p);
   }
 }
@@ -701,7 +737,8 @@ void walk(const Handle(XCAFDoc_ShapeTool)& st, const Handle(XCAFDoc_ColorTool)& 
 }  // namespace
 
 // Reads a STEP file with its product structure: one shape per solid, placed. sk_last_meta() then holds one line
-// per shape: name TAB color ("r g b" in sRGB 0..1, or "-") TAB the assemblies it sits in, separated by 0x1F.
+// per shape: name TAB color ("r g b" in sRGB 0..1, or "-") TAB the assemblies it sits in, separated by 0x1F, TAB the
+// faces with their own colour ("face r g b", separated by 0x1E).
 int sk_read_step_doc(const char* path, SkShape*** out, size_t* n) {
   return guard([&] {
     g_meta.clear();
@@ -747,6 +784,13 @@ int sk_read_step_doc(const char* path, SkShape*** out, size_t* n) {
         if (k) meta += '\x1f';
         meta += parts[i].path[k];
       }
+      meta += '\t';
+      for (size_t k = 0; k < parts[i].faces.size(); ++k) {
+        Standard_Real r, g, b;
+        parts[i].faces[k].second.Values(r, g, b, Quantity_TOC_sRGB);
+        if (k) meta += '\x1e';
+        meta += std::to_string(parts[i].faces[k].first) + " " + std::to_string(r) + " " + std::to_string(g) + " " + std::to_string(b);
+      }
       meta += '\n';
     }
     g_meta = meta;
@@ -757,8 +801,10 @@ int sk_read_step_doc(const char* path, SkShape*** out, size_t* n) {
 }
 
 // Writes shapes as named, colored parts (names as UTF-8; colors sRGB, a NaN red = none), each inside the nested
-// assemblies its path names (0x1F between them; empty = at the top). schema as sk_write_step_schema.
-int sk_write_step_doc(const SkShape* const* shapes, const char* const* names, const double* rgb, const char* const* paths, size_t n, const char* path, int schema) {
+// assemblies its path names (0x1F between them; empty = at the top), with its faces painted their own colours
+// (`face_counts[i]` entries of face index, r, g, b in `faces`, part after part). schema as sk_write_step_schema.
+int sk_write_step_doc(const SkShape* const* shapes, const char* const* names, const double* rgb, const char* const* paths,
+                      const size_t* face_counts, const double* faces, size_t n, const char* path, int schema) {
   return guard([&] {
     Handle(XCAFApp_Application) app = XCAFApp_Application::GetApplication();
     Handle(TDocStd_Document) doc;
@@ -778,6 +824,16 @@ int sk_write_step_doc(const SkShape* const* shapes, const char* const* names, co
       TDF_Label l = st->AddShape(shapes[i]->shape, false);
       if (names && names[i]) TDataStd_Name::Set(l, TCollection_ExtendedString(names[i], Standard_True));
       if (rgb && rgb[3 * i] == rgb[3 * i]) ct->SetColor(l, Quantity_Color(rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2], Quantity_TOC_sRGB), XCAFDoc_ColorGen);
+      if (face_counts && faces && face_counts[i] > 0) {
+        TopTools_IndexedMapOfShape map;
+        TopExp::MapShapes(shapes[i]->shape, TopAbs_FACE, map);
+        for (size_t k = 0; k < face_counts[i]; ++k, faces += 4) {
+          int at = int(faces[0]) + 1;
+          if (!(faces[0] >= 0) || at > map.Extent()) continue;
+          TDF_Label fl = st->AddSubShape(l, map(at));
+          if (!fl.IsNull()) ct->SetColor(fl, Quantity_Color(faces[1], faces[2], faces[3], Quantity_TOC_sRGB), XCAFDoc_ColorSurf);
+        }
+      }
       std::string p = paths && paths[i] ? paths[i] : "";
       if (p.empty()) continue;
       TDF_Label parent;
@@ -3371,6 +3427,72 @@ int sk_fillet_edges_ex(const SkShape* s, const uint32_t* ids, size_t n, double s
 // `budget`: seconds the repair may take (0 = no limit). Past it, the repair runs again without its slowest part
 // (fixing self-intersecting wires, #21) with the same budget, and past that too the shape stays unrepaired; `cut`
 // is then 1 (the faster repair was used) or 2 (no repair).
+// For each of `after`'s faces (a repair of `before`), the index of the face of `before` it came from, else UINT32_MAX:
+// the same face; else the one face of `before` on the same surface; else the face a point inside it lies on.
+int sk_match_faces(const SkShape* before, const SkShape* after, uint32_t* index, size_t n) {
+  return guard([&] {
+    for (size_t i = 0; i < n; ++i) index[i] = UINT32_MAX;
+    TopTools_IndexedMapOfShape old_faces, new_faces;
+    TopExp::MapShapes(before->shape, TopAbs_FACE, old_faces);
+    TopExp::MapShapes(after->shape, TopAbs_FACE, new_faces);
+    std::map<const Geom_Surface*, std::vector<int>> on_surface;
+    for (int k = 1; k <= old_faces.Extent(); ++k) {
+      TopLoc_Location loc;
+      Handle(Geom_Surface) g = BRep_Tool::Surface(TopoDS::Face(old_faces(k)), loc);
+      if (!g.IsNull()) on_surface[g.get()].push_back(k);
+    }
+    std::vector<Bnd_Box> boxes;  // made when first needed
+    for (int k = 1; k <= new_faces.Extent() && size_t(k) <= n; ++k) {
+      if (stop_now()) return fail("import canceled");
+      const TopoDS_Face& f = TopoDS::Face(new_faces(k));
+      int same = old_faces.FindIndex(f);
+      if (same > 0) {
+        index[k - 1] = uint32_t(same - 1);
+        continue;
+      }
+      TopLoc_Location loc;
+      Handle(Geom_Surface) g = BRep_Tool::Surface(f, loc);
+      auto it = g.IsNull() ? on_surface.end() : on_surface.find(g.get());
+      if (it != on_surface.end() && it->second.size() == 1) {
+        index[k - 1] = uint32_t(it->second[0] - 1);
+        continue;
+      }
+      // A point well inside the face, from a grid over its parameters.
+      Standard_Real u0, u1, v0, v1;
+      BRepTools::UVBounds(f, u0, u1, v0, v1);
+      BRepTopAdaptor_FClass2d inside(f, 1e-7);
+      gp_Pnt p;
+      bool found = false;
+      for (int step = 2; step <= 8 && !found; step *= 2)
+        for (int a = 1; a < step && !found; ++a)
+          for (int b = 1; b < step && !found; ++b) {
+            gp_Pnt2d uv(u0 + (u1 - u0) * a / step, v0 + (v1 - v0) * b / step);
+            if (inside.Perform(uv) != TopAbs_IN) continue;
+            p = BRep_Tool::Surface(f)->Value(uv.X(), uv.Y());
+            found = true;
+          }
+      if (!found) continue;
+      if (boxes.empty()) {
+        boxes.resize(size_t(old_faces.Extent()));
+        for (int j = 1; j <= old_faces.Extent(); ++j) BRepBndLib::Add(old_faces(j), boxes[size_t(j - 1)]);
+      }
+      TopoDS_Vertex vx = BRepBuilderAPI_MakeVertex(p);
+      double best = 1e-3;
+      for (int j = 1; j <= old_faces.Extent(); ++j) {
+        Bnd_Box box = boxes[size_t(j - 1)];
+        box.Enlarge(1e-3);
+        if (box.IsOut(p)) continue;
+        BRepExtrema_DistShapeShape d(vx, old_faces(j));
+        if (d.IsDone() && d.Value() < best) {
+          best = d.Value();
+          index[k - 1] = uint32_t(j - 1);
+        }
+      }
+    }
+    return 0;
+  });
+}
+
 int sk_heal(const SkShape* s, int flags, double budget, int* cut, SkShape** out) {
   return guard([&] {
     *cut = 0;

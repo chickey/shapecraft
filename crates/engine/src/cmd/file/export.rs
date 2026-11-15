@@ -163,7 +163,12 @@ fn export_step(s: &mut Session, p: &Params) -> Result<Value> {
                 .unwrap_or_default();
             Ok((
                 crate::cmd::model::working_shape(s, b.id, false)?,
-                shapecraft_kernel::PartInfo { name: Some(b.name.clone()), color: b.appearance.as_ref().map(|a| a.color), path },
+                shapecraft_kernel::PartInfo {
+                    name: Some(b.name.clone()),
+                    color: b.appearance.as_ref().map(|a| a.color),
+                    path,
+                    face_colors: if b.facets.is_none() { b.face_colors.clone() } else { Vec::new() },
+                },
             ))
         })
         .collect::<Result<Vec<_>>>()?;

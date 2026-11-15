@@ -52,6 +52,8 @@ unsafe extern "C" {
         names: *const *const c_char,
         rgb: *const f64,
         paths: *const *const c_char,
+        face_counts: *const usize,
+        faces: *const f64,
         n: usize,
         path: *const c_char,
         schema: i32,
@@ -61,6 +63,7 @@ unsafe extern "C" {
     pub fn sk_from_mesh(xyz: *const f64, nverts: usize, idx: *const u32, ntris: usize, out: *mut *mut SkShape) -> i32;
     pub fn sk_shape_array_free(arr: *mut *mut SkShape);
     pub fn sk_from_brep(data: *const f64, n: usize, out: *mut *mut SkShape) -> i32;
+    pub fn sk_match_faces(before: *const SkShape, after: *const SkShape, index: *mut u32, n: usize) -> i32;
     pub fn sk_from_brep_faces(data: *const f64, n: usize, out: *mut *mut SkShape, face_index: *mut u32, nfaces: usize) -> i32;
     pub fn sk_to_brep(s: *const SkShape, out: *mut *mut f64, n: *mut usize) -> i32;
     pub fn sk_doubles_free(d: *mut f64);
