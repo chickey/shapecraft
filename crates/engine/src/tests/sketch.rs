@@ -619,3 +619,33 @@ fn select_text_takes_every_letter_but_no_counters() {
     let rect = s.doc.sketch(sk).unwrap().regions().iter().find(|r| r.centroid.y < -30.0).unwrap().index;
     assert!(s.execute("select_text", &serde_json::json!({"sketch": sk.0, "region": rect})).is_err());
 }
+
+/// Offset Edge on the edges of a body lying on the open sketch's plane (a board's outline): only their offset goes
+/// into the sketch, the four sides joined as one rectangle 1 mm in.
+#[test]
+fn offset_edge_takes_body_edges_on_the_sketch_plane() {
+    let mut s = session();
+    s.execute("sketch", &json!({"plane": "xy"})).unwrap();
+    s.execute("rectangle", &json!({"corner": [0, 0], "opposite": [10, 20]})).unwrap();
+    s.execute("extrude", &json!({"sketch": 1, "region": 0, "distance": 5})).unwrap();
+    let body = s.doc.bodies[0].id;
+    let top = (0..6).find(|&f| s.kernel.face_plane(&s.doc.bodies[0].shape, f).unwrap().is_some_and(|p| p.origin.z > 4.9)).unwrap();
+    s.execute("sketch", &json!({"body": body.0, "face": top})).unwrap();
+    let sketch = s.active_sketch.unwrap();
+    let m = s.doc.bodies[0].mesh.clone();
+    let edges: Vec<serde_json::Value> = (0..m.edges.len())
+        .filter(|&k| m.edges[k].iter().all(|p| (p[2] - 5.0).abs() < 1e-4))
+        .map(|k| json!({"body": body.0, "edge": m.edge_ids[k]}))
+        .collect();
+    assert_eq!(edges.len(), 4);
+    s.execute("offset_edge", &json!({"edges": edges, "distance": -1})).unwrap();
+    let sk = s.doc.sketch(sketch).unwrap();
+    assert_eq!(sk.entities.len(), 4, "only the offset, not the edges themselves");
+    let mut lens: Vec<f64> = sk.entities.iter().map(|e| e.outline()[0].distance(*e.outline().last().unwrap())).collect();
+    lens.sort_by(f64::total_cmp);
+    assert!((lens[0] - 8.0).abs() < 1e-6 && (lens[3] - 18.0).abs() < 1e-6, "{lens:?}");
+    // An edge off the plane is refused.
+    let side = (0..m.edges.len()).find(|&k| m.edges[k].iter().any(|p| p[2] < 1.0)).unwrap();
+    let off = json!([{"body": body.0, "edge": s.doc.bodies[0].mesh.edge_ids[side]}]);
+    assert!(s.execute("offset_edge", &json!({"edges": off, "distance": 1})).is_err());
+}

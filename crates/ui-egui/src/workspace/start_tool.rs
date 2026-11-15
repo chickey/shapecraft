@@ -586,7 +586,9 @@ impl Workspace {
                     self.await_selection(ToolKind::Trim, "Select the parts of sketch curves between crossings to trim them away");
                 }
             }
-            ToolKind::OffsetEdge if matches!(self.session.selection.as_slice(), [Pick::Edge { .. }]) => {
+            ToolKind::OffsetEdge
+                if self.session.active_sketch.is_none() && matches!(self.session.selection.as_slice(), [Pick::Edge { .. }]) =>
+            {
                 match tools::BodyEdgeOffsetTool::from_selection(&self.session, self.last_hit) {
                     Some(mut t) => {
                         t.face_viewer(self.camera.back());

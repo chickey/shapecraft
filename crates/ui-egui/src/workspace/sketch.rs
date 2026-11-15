@@ -12,6 +12,29 @@ use super::tools::Tool;
 impl Workspace {
     /// Offset Edge, Chain: grows the picked sketch curves to every curve joined to them end to end.
     pub(super) fn select_chains(&mut self) {
+        // In a sketch, picked edges of bodies on its plane grow to the outlines they're part of.
+        let edges: Vec<(ItemId, u32)> = self
+            .session
+            .selection
+            .iter()
+            .filter_map(|p| match *p {
+                Pick::Edge { body, edge } => Some((body, edge)),
+                _ => None,
+            })
+            .collect();
+        if self.session.active_sketch.is_some() && !edges.is_empty() {
+            let mut all: Vec<Pick> = Vec::new();
+            for (body, edge) in edges {
+                for p in self.edge_chain(body, edge) {
+                    if !all.contains(&p) {
+                        all.push(p);
+                    }
+                }
+            }
+            self.session.selection.retain(|p| !matches!(p, Pick::Edge { .. }));
+            self.session.selection.extend(all);
+            return;
+        }
         let mut picked: Vec<(ItemId, u32)> = self
             .session
             .selection
@@ -49,6 +72,43 @@ impl Workspace {
             k += 1;
         }
         self.session.selection = picked.into_iter().map(|(sketch, entity)| Pick::SketchEntity { sketch, entity }).collect();
+    }
+
+    /// The edges of `body` lying on the open sketch's plane that join `edge` end to end: the outline it's part of
+    /// (a board's whole outline from one of its sides). Just `edge` when it isn't on the plane.
+    pub(super) fn edge_chain(&self, body: ItemId, edge: u32) -> Vec<Pick> {
+        let one = vec![Pick::Edge { body, edge }];
+        let (Some(sk), Some(b)) = (self.session.active_sketch(), self.session.doc.body(body)) else { return one };
+        let (n, o) = (sk.plane.normal(), sk.plane.origin);
+        let v = |p: &[f32; 3]| glam::DVec3::new(p[0].into(), p[1].into(), p[2].into());
+        let on = |q: glam::DVec3| (q - o).dot(n).abs() < 5e-4 + 1e-6 * q.length();
+        // Each edge on the plane with its two ends.
+        let ends: Vec<(u32, glam::DVec3, glam::DVec3)> = b
+            .mesh
+            .edges
+            .iter()
+            .zip(&b.mesh.edge_ids)
+            .filter_map(|(line, &id)| {
+                let (first, last) = (v(line.first()?), v(line.last()?));
+                line.iter().all(|p| on(v(p))).then_some((id, first, last))
+            })
+            .collect();
+        if !ends.iter().any(|e| e.0 == edge) {
+            return one;
+        }
+        let near = |a: glam::DVec3, c: glam::DVec3| a.distance(c) < 1e-4 * (1.0 + a.length());
+        let mut chain = vec![edge];
+        let mut k = 0;
+        while k < chain.len() && chain.len() < 100_000 {
+            let Some(&(_, a, z)) = ends.iter().find(|e| e.0 == chain[k]) else { break };
+            for &(id, c, d) in &ends {
+                if !chain.contains(&id) && [a, z].iter().any(|p| near(*p, c) || near(*p, d)) {
+                    chain.push(id);
+                }
+            }
+            k += 1;
+        }
+        chain.into_iter().map(|edge| Pick::Edge { body, edge }).collect()
     }
 
     pub(crate) fn polygon_sides(&self) -> u32 {
@@ -262,5 +322,36 @@ impl Workspace {
         let kind = self.pending_tool.take().unwrap_or(ToolKind::Line);
         self.tool = self.sketch_tool(kind);
         true
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod edge_chain_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// In a sketch on a block's top, one picked side of the top grows to the top's whole outline (and not to the
+    /// block's other edges), and Offset Edge then starts from those edges.
+    #[test]
+    fn a_picked_edge_grows_to_its_outline_and_offset_edge_takes_it() {
+        let mut s = shapecraft_engine::Session::new(Arc::new(shapecraft_kernel_occt::OcctKernel::new()), "Chains");
+        s.execute("sketch", &json!({"plane": "xy"})).unwrap();
+        s.execute("rectangle", &json!({"corner": [0, 0], "opposite": [10, 20]})).unwrap();
+        s.execute("extrude", &json!({"sketch": 1, "region": 0, "distance": 5})).unwrap();
+        let body = s.doc.bodies[0].id;
+        let top = (0..6).find(|&f| s.kernel.face_plane(&s.doc.bodies[0].shape, f).unwrap().is_some_and(|p| p.origin.z > 4.9)).unwrap();
+        s.execute("sketch", &json!({"body": body.0, "face": top})).unwrap();
+        let m = s.doc.bodies[0].mesh.clone();
+        let k = (0..m.edges.len()).find(|&k| m.edges[k].iter().all(|p| (p[2] - 5.0).abs() < 1e-4)).unwrap();
+        let mut ws = Workspace::new(s, crate::settings::Settings::default());
+        ws.session.selection = vec![Pick::Edge { body, edge: m.edge_ids[k] }];
+        ws.select_chains();
+        assert_eq!(ws.session.selection.len(), 4, "{:?}", ws.session.selection);
+        let t = crate::workspace::tools::OffsetEdgeTool::from_selection(&ws.session).unwrap();
+        assert_eq!(t.edges.len(), 4);
+        let (id, params) = t.request(-1.0);
+        assert_eq!(id, "offset_edge");
+        assert_eq!(params["edges"].as_array().unwrap().len(), 4);
     }
 }

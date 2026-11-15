@@ -722,6 +722,18 @@ impl Workspace {
                 .chain(bottom.iter().copied())
                 .find(|d| d.label == label);
         }
+        // In a sketch, a running tool's lit button clicked again (one with no variants or options to show) puts the
+        // tool down, back to picking: a sketch starts with Line armed, and this is the way to put it down.
+        if let Some(def) = clicked
+            && self.session.active_sketch.is_some()
+            && matches!(def.action, Action::Tool(_))
+            && is_active(self, &def)
+            && toolbar::variants(def.label).0.is_empty()
+            && tool_options(self).is_empty()
+        {
+            self.tool = Tool::Idle;
+            clicked = None;
+        }
         if drawing {
             self.right_column(ui);
             if let Some(def) = clicked {

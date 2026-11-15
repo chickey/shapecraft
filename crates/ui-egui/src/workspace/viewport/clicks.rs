@@ -447,6 +447,18 @@ impl Workspace {
     /// up); on a finished sketch's curve or region that sketch opens for editing where it is in the history, the
     /// camera staying put, with the curve's chain or the region's outline selected. Elsewhere nothing happens.
     fn double_click(&mut self, c: Pos2) -> bool {
+        // In a sketch, with no tool drawing: a double-click picks the whole of what it lands on, a chain of the
+        // sketch's curves or the outline a body edge on its plane is part of (a board's whole outline).
+        if self.session.active_sketch.is_some() && matches!(self.tool, Tool::Idle) && !self.visualizing && self.drawings.is_none() {
+            return match self.pick_at(c).map(|(p, _)| p) {
+                Some(p @ (Pick::Edge { .. } | Pick::SketchEntity { .. })) => {
+                    self.session.selection = vec![p];
+                    self.select_chains();
+                    true
+                }
+                _ => false,
+            };
+        }
         if self.session.active_sketch.is_some() || self.visualizing || self.drawings.is_some() {
             return false;
         }

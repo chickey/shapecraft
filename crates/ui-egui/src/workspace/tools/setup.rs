@@ -1199,6 +1199,20 @@ impl OffsetEdgeTool {
         let mut sketch = None;
         let mut entities = Vec::new();
         let mut region = None;
+        // In a sketch, picked edges of bodies on its plane, when no curve of it is picked.
+        let edges: Vec<(ItemId, u32)> = s
+            .selection
+            .iter()
+            .filter_map(|p| match *p {
+                Pick::Edge { body, edge } => Some((body, edge)),
+                _ => None,
+            })
+            .collect();
+        if let (Some(open), false, false) =
+            (s.active_sketch, edges.is_empty(), s.selection.iter().any(|p| matches!(p, Pick::SketchEntity { .. } | Pick::Region { .. })))
+        {
+            return Self::from_edges(s, open, edges);
+        }
         for pick in &s.selection {
             match *pick {
                 Pick::SketchEntity { sketch: sk, entity } if sketch.is_none_or(|x| x == sk) && region.is_none() => {
@@ -1225,7 +1239,31 @@ impl OffsetEdgeTool {
         let w0 = sk.plane.to_world(p0);
         let dir = (sk.plane.to_world(nearest) - w0).try_normalize()?;
         let picked = entities.clone();
-        Some(Self { sketch, entities, region, face: None, distance: 0.0, anchor: w0, dir, dragging: None, picked })
+        Some(Self { sketch, entities, region, face: None, edges: Vec::new(), distance: 0.0, anchor: w0, dir, dragging: None, picked })
+    }
+
+    /// Edges of bodies on the open sketch's plane: the arrow on the first one, where a 1 mm offset lands.
+    fn from_edges(s: &Session, sketch: ItemId, edges: Vec<(ItemId, u32)>) -> Option<Self> {
+        let sk = s.doc.sketch(sketch)?;
+        let probe = shapecraft_engine::offset_body_edges(s, sketch, &edges, 1.0).ok()?;
+        let first = shapecraft_engine::body_edge_entities(s, sketch, &edges[..1]).ok()?;
+        let base = first.first()?.outline();
+        let p0 = (*base.first()? + *base.get(1)?) / 2.0;
+        let nearest = nearest_on(&probe, p0)?;
+        let w0 = sk.plane.to_world(p0);
+        let dir = (sk.plane.to_world(nearest) - w0).try_normalize()?;
+        Some(Self {
+            sketch,
+            entities: Vec::new(),
+            region: None,
+            face: None,
+            edges,
+            distance: 0.0,
+            anchor: w0,
+            dir,
+            dragging: None,
+            picked: Vec::new(),
+        })
     }
 
     /// On a picked flat body face: its whole outline, the arrow on its first edge (s24-008).
@@ -1244,6 +1282,7 @@ impl OffsetEdgeTool {
             entities: Vec::new(),
             region: None,
             face: Some((*body, *face)),
+            edges: Vec::new(),
             distance: 0.0,
             anchor: w0,
             dir,
@@ -1255,6 +1294,10 @@ impl OffsetEdgeTool {
     pub fn request(&self, distance: f64) -> (&'static str, serde_json::Value) {
         if let Some((body, face)) = self.face {
             return ("offset_edge", json!({ "body": body.0, "face": face, "distance": distance }));
+        }
+        if !self.edges.is_empty() {
+            let edges: Vec<serde_json::Value> = self.edges.iter().map(|(b, e)| json!({ "body": b.0, "edge": e })).collect();
+            return ("offset_edge", json!({ "sketch": self.sketch.0, "edges": edges, "distance": distance }));
         }
         match self.region {
             Some(r) => ("offset_edge", json!({ "sketch": self.sketch.0, "region": r, "distance": distance })),

@@ -11,7 +11,7 @@ pub(crate) mod model;
 mod sketch;
 mod visual;
 
-pub use sketch::{face_offset, offset_entities};
+pub use sketch::{body_edge_entities, face_offset, offset_body_edges, offset_entities};
 
 pub use model::{extrude_auto_body, revolve_auto, set_body_shape};
 

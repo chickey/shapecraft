@@ -512,6 +512,8 @@ pub struct OffsetEdgeTool {
     pub region: Option<u32>,
     /// A flat body face whose outline is offset into a new sketch on it (no sketch yet).
     pub face: Option<(ItemId, u32)>,
+    /// Edges of bodies lying on the open sketch's plane (a board's outline): only their offset is added.
+    pub edges: Vec<(ItemId, u32)>,
     pub distance: f64,
     /// A point on the first curve and the way a positive offset moves it, in world space.
     pub anchor: DVec3,

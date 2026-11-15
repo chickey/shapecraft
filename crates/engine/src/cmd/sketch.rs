@@ -278,7 +278,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             menu: "Sketch/Offset Edge/Single",
             shortcut: Some("O"),
             help: "Draw a parallel copy of the selected sketch curves",
-            params: r#"{"distance": mm, "entities": [n]? | "region": n, "sketch": id? | "body": id, "face": n}  (default: the selected curves or region; connected curves offset as one chain; positive is outwards, or left of a line; a flat body face's outline goes into a new sketch on it)"#,
+            params: r#"{"distance": mm, "entities": [n]? | "region": n | "edges": [{"body": id, "edge": n}], "sketch": id? | "body": id, "face": n}  (default: the selected curves or region; connected curves offset as one chain; positive is outwards, or left of a line; edges of bodies on the sketch's plane add only their offset; a flat body face's outline goes into a new sketch on it)"#,
             modifies: true,
             enabled: |s| {
                 s.active_sketch.is_some()
@@ -947,6 +947,35 @@ fn offset_edge(s: &mut Session, p: &Params) -> Result<Value> {
         s.selection.clear();
         return Ok(json!({ "sketch": id.0, "name": name }));
     }
+    // Edges of bodies lying on the sketch's plane (a board's outline): only their offset goes into the sketch.
+    if p.has("edges") {
+        let id = target_sketch(s, p)?;
+        let edges: Vec<(ItemId, u32)> = p
+            .raw("edges")
+            .and_then(Value::as_array)
+            .ok_or_else(|| EngineError::BadParams("edges is a list of {body, edge}".into()))?
+            .iter()
+            .take(10_001)
+            .map(|e| match (e["body"].as_u64(), e["edge"].as_u64()) {
+                (Some(b), Some(k)) if k <= u64::from(u32::MAX) => Ok((ItemId(b), k as u32)),
+                _ => Err(EngineError::BadParams("each edge is {\"body\": id, \"edge\": n}".into())),
+            })
+            .collect::<Result<_>>()?;
+        if edges.len() > 10_000 {
+            return Err(EngineError::BadParams("too many edges".into()));
+        }
+        let added = offset_body_edges(s, id, &edges, distance)?;
+        let sketch = s.doc.sketch_mut(id).ok_or_else(|| EngineError::BadParams(format!("no sketch {}", id.0)))?;
+        if sketch.entities.len() + added.len() > 100_000 {
+            return Err(EngineError::BadParams("too many curves".into()));
+        }
+        let first = sketch.entities.len() as u32;
+        let n = added.len() as u32;
+        sketch.entities.extend(added);
+        sketch.visible = true;
+        s.selection = (first..first + n).map(|entity| Pick::SketchEntity { sketch: id, entity }).collect();
+        return Ok(json!({ "sketch": id.0, "entities": (first..first + n).collect::<Vec<_>>() }));
+    }
     let (id, entities, region): (ItemId, Vec<u32>, Option<u32>) = if p.has("region") {
         (target_sketch(s, p)?, Vec::new(), Some(p.f64("region")? as u32))
     } else if p.has("entities") {
@@ -1114,6 +1143,36 @@ pub fn face_offset(s: &Session, body: ItemId, face: u32, distance: f64) -> Resul
     Ok((plane, on_body, out))
 }
 
+/// Body edges lying on a sketch's plane, as curves of it (in its coordinates). An edge off the plane is refused.
+pub fn body_edge_entities(s: &Session, sketch: ItemId, edges: &[(ItemId, u32)]) -> Result<Vec<SketchEntity>> {
+    let sk = s.doc.sketch(sketch).ok_or_else(|| EngineError::BadParams(format!("no sketch {}", sketch.0)))?;
+    let n = sk.plane.normal();
+    edges
+        .iter()
+        .map(|&(body, edge)| {
+            let b = s.doc.body(body).ok_or_else(|| EngineError::BadParams(format!("no body {}", body.0)))?;
+            let k = b.mesh.edge_ids.iter().position(|e| *e == edge).ok_or_else(|| EngineError::BadParams(format!("no edge {edge}")))?;
+            let on = b.mesh.edges.get(k).is_some_and(|line| {
+                line.iter().all(|p| {
+                    let q = glam::DVec3::new(p[0].into(), p[1].into(), p[2].into());
+                    (q - sk.plane.origin).dot(n).abs() < 1e-3 + 1e-6 * q.length()
+                })
+            });
+            if !on {
+                return Err(EngineError::NotAvailable("pick edges that lie on the sketch's plane".into()));
+            }
+            edge_entity(&sk.plane, s.kernel.edge_curve(&b.shape, edge)?)
+                .ok_or_else(|| EngineError::NotAvailable("that edge's curve can't be drawn in the sketch".into()))
+        })
+        .collect()
+}
+
+/// Offset Edge on body edges lying on the sketch's plane: their offset, connected ones offset as one chain.
+pub fn offset_body_edges(s: &Session, sketch: ItemId, edges: &[(ItemId, u32)], distance: f64) -> Result<Vec<SketchEntity>> {
+    let sk = s.doc.sketch(sketch).ok_or_else(|| EngineError::BadParams(format!("no sketch {}", sketch.0)))?;
+    offset_curves_of(s, sk, body_edge_entities(s, sketch, edges)?, distance)
+}
+
 /// What Offset Edge adds to a sketch: a region's outline offset as a whole, a connected chain of curves with
 /// joined corners, or each curve on its own. Positive is outwards (or to the left of a lone line).
 pub fn offset_entities(s: &Session, sketch: ItemId, entities: &[u32], region: Option<u32>, distance: f64) -> Result<Vec<SketchEntity>> {
@@ -1126,13 +1185,22 @@ pub fn offset_entities(s: &Session, sketch: ItemId, entities: &[u32], region: Op
         let face = &sk.region(r).ok_or_else(|| EngineError::BadParams(format!("no region {r}")))?.face;
         return from_shape(&s.kernel.offset_face_outline(face, distance)?);
     }
-    let picked: Vec<&SketchEntity> = entities
+    let picked: Vec<SketchEntity> = entities
         .iter()
-        .map(|&i| sk.entities.get(i as usize).ok_or_else(|| EngineError::BadParams(format!("no sketch curve {i}"))))
+        .map(|&i| sk.entities.get(i as usize).cloned().ok_or_else(|| EngineError::BadParams(format!("no sketch curve {i}"))))
         .collect::<Result<_>>()?;
+    offset_curves_of(s, sk, picked, distance)
+}
+
+/// Curves in `sk`'s plane offset: connected ones as one chain with joined corners, else each on its own.
+fn offset_curves_of(s: &Session, sk: &Sketch, picked: Vec<SketchEntity>, distance: f64) -> Result<Vec<SketchEntity>> {
+    let from_shape = |shape: &shapecraft_kernel::Shape| -> Result<Vec<SketchEntity>> {
+        let n = s.kernel.edge_count(shape)?;
+        Ok((0..n.min(10_000)).filter_map(|i| s.kernel.edge_curve(shape, i).ok().and_then(|c| edge_entity(&sk.plane, c))).collect())
+    };
     if picked.len() >= 2 {
         let mut one = sk.clone();
-        one.entities = picked.iter().map(|e| (*e).clone()).collect();
+        one.entities = picked.clone();
         if let Ok(shape) = s.kernel.offset_curves(sk.frame(), &one.curves(), distance) {
             let out = from_shape(&shape)?;
             if !out.is_empty() {
